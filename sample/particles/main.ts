@@ -32,6 +32,9 @@ const presentationFormat = 'rgba16float';
 
 const displaySettings = {
   colorSpace: 'srgb' as string,
+  // rgba8unorm clamps colors outside the color space when the image is copied,
+  // while rgba16float preserves them (and avoids banding in linear spaces).
+  textureFormat: 'rgba8unorm' as 'rgba8unorm' | 'rgba16float',
   toneMappingMode: 'standard' as GPUCanvasToneMappingMode,
 };
 
@@ -193,16 +196,24 @@ assert(isPowerOf2(imageBitmap.width), 'image must be a power of 2');
 // Calculate number of mip levels required to generate the probability map
 const mipLevelCount =
   (Math.log2(Math.max(imageBitmap.width, imageBitmap.height)) + 1) | 0;
-const logoTexture = device.createTexture({
-  size: [imageBitmap.width, imageBitmap.height, 1],
-  mipLevelCount,
-  format: 'rgba16float',
-  usage:
-    GPUTextureUsage.TEXTURE_BINDING |
-    GPUTextureUsage.STORAGE_BINDING |
-    GPUTextureUsage.COPY_DST |
-    GPUTextureUsage.RENDER_ATTACHMENT,
-});
+let logoTexture: GPUTexture;
+// Creates the logo texture in the current texture format, copies the image
+// into it, and generates the probability map.
+function createLogoTexture() {
+  logoTexture?.destroy();
+  logoTexture = device.createTexture({
+    size: [imageBitmap.width, imageBitmap.height, 1],
+    mipLevelCount,
+    format: displaySettings.textureFormat,
+    usage:
+      GPUTextureUsage.TEXTURE_BINDING |
+      GPUTextureUsage.STORAGE_BINDING |
+      GPUTextureUsage.COPY_DST |
+      GPUTextureUsage.RENDER_ATTACHMENT,
+  });
+  reinitLogoTexture();
+  generateProbabilityMap();
+}
 // Copies the image into mip level 0, converting its colors to the current
 // color space. The alpha channel (used for the probability map) is unaffected
 // by the color space, so the probability map doesn't need regenerating.
@@ -216,7 +227,6 @@ function reinitLogoTexture() {
     [imageBitmap.width, imageBitmap.height]
   );
 }
-reinitLogoTexture();
 
 //////////////////////////////////////////////////////////////////////////////
 // Probability map generation
@@ -224,21 +234,37 @@ reinitLogoTexture();
 // in the alpha channel. The mip levels 1..N are generated to hold spawn
 // probabilities up to the top 1x1 mip level.
 //////////////////////////////////////////////////////////////////////////////
-{
-  const probabilityMapImportLevelPipeline = device.createComputePipeline({
-    layout: 'auto',
-    compute: {
-      module: device.createShaderModule({ code: probabilityMapWGSL }),
-      entryPoint: 'import_level',
-    },
-  });
-  const probabilityMapExportLevelPipeline = device.createComputePipeline({
-    layout: 'auto',
-    compute: {
-      module: device.createShaderModule({ code: probabilityMapWGSL }),
-      entryPoint: 'export_level',
-    },
-  });
+// The storage texture format is part of the shader, so create a pair of
+// pipelines for each texture format.
+const probabilityMapPipelines = new Map<
+  GPUTextureFormat,
+  { importLevel: GPUComputePipeline; exportLevel: GPUComputePipeline }
+>();
+function getProbabilityMapPipelines(format: GPUTextureFormat) {
+  let pipelines = probabilityMapPipelines.get(format);
+  if (!pipelines) {
+    const module = device.createShaderModule({
+      code: probabilityMapWGSL.replace('rgba8unorm', format),
+    });
+    pipelines = {
+      importLevel: device.createComputePipeline({
+        layout: 'auto',
+        compute: { module, entryPoint: 'import_level' },
+      }),
+      exportLevel: device.createComputePipeline({
+        layout: 'auto',
+        compute: { module, entryPoint: 'export_level' },
+      }),
+    };
+    probabilityMapPipelines.set(format, pipelines);
+  }
+  return pipelines;
+}
+function generateProbabilityMap() {
+  const {
+    importLevel: probabilityMapImportLevelPipeline,
+    exportLevel: probabilityMapExportLevelPipeline,
+  } = getProbabilityMapPipelines(logoTexture.format);
 
   const probabilityMapUBOBufferSize =
     1 * 4 + // stride
@@ -291,7 +317,7 @@ reinitLogoTexture();
           // tex_in / tex_out
           binding: 3,
           resource: logoTexture.createView({
-            format: 'rgba16float',
+            format: logoTexture.format,
             dimension: '2d',
             baseMipLevel: level,
             mipLevelCount: 1,
@@ -314,6 +340,9 @@ reinitLogoTexture();
     }
   }
   device.queue.submit([commandEncoder.finish()]);
+  probabilityMapUBOBuffer.destroy();
+  buffer_a.destroy();
+  buffer_b.destroy();
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -358,6 +387,9 @@ for (const option of colorSpaceController.domElement.querySelectorAll(
 )) {
   option.disabled = !isColorSpaceSupported(option.value);
 }
+colorFolder
+  .add(displaySettings, 'textureFormat', ['rgba8unorm', 'rgba16float'])
+  .onChange(initLogoTextureAndBindGroup);
 colorFolder.open();
 const p3MediaQuery = window.matchMedia('(color-gamut: p3)');
 function updateColorSpaceName() {
@@ -403,14 +435,20 @@ const computePipeline = device.createComputePipeline({
     entryPoint: 'simulate',
   },
 });
-const computeBindGroup = device.createBindGroup({
-  layout: computePipeline.getBindGroupLayout(0),
-  entries: [
-    { binding: 0, resource: simulationUBOBuffer },
-    { binding: 1, resource: particlesBuffer },
-    { binding: 2, resource: logoTexture.createView() },
-  ],
-});
+let computeBindGroup: GPUBindGroup;
+// (Re)creates the logo texture and the compute bind group that samples it.
+function initLogoTextureAndBindGroup() {
+  createLogoTexture();
+  computeBindGroup = device.createBindGroup({
+    layout: computePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: simulationUBOBuffer },
+      { binding: 1, resource: particlesBuffer },
+      { binding: 2, resource: logoTexture.createView() },
+    ],
+  });
+}
+initLogoTextureAndBindGroup();
 
 const aspect = canvas.width / canvas.height;
 const projection = mat4.perspective((2 * Math.PI) / 5, aspect, 1, 100.0);
